@@ -1,0 +1,387 @@
+Add-Type -AssemblyName System.Windows.Forms;
+Add-Type -AssemblyName System.Drawing;
+
+# 1. Укажите имена или IP-адреса всех 8 терминальных серверов
+$Servers = @(
+    "ts01",
+    "ts02",
+    "ts03",
+    "ts04",
+    "ts05",
+    "ts06",
+    "ts07",
+    "ts08",
+    "tsr01",
+    "tsr02",
+    "tsr03",
+    "tsr04"
+);
+
+# Функция проверки прав текущего специалиста на сервере через WMI (RDP-Tcp)
+function Get-RDSUserPermissions {
+    param([string]$ServerName);
+
+    $Perms = [PSCustomObject]@{
+        CanShadow     = $false;
+        CanLogoff     = $false;
+        CanDisconnect = $false;
+        CanMessage    = $false;
+        Summary       = "Нет данных (WMI недоступен)";
+    };
+
+    try {
+        $Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent();
+        $UserSids = @($Identity.User.Value);
+        foreach ($Group in $Identity.Groups) {
+            $UserSids += $Group.Value;
+        }
+
+        $TsPerm = Get-CimInstance -ComputerName $ServerName -Namespace "root\CIMV2\TerminalServices" -ClassName "Win32_TSPermissionsSetting" -Filter "TerminalName='RDP-Tcp'" -ErrorAction Stop;
+        $SDResult = Invoke-CimMethod -InputObject $TsPerm -MethodName "GetSecurityDescriptor" -ErrorAction Stop;
+
+        if ($SDResult.ReturnValue -eq 0 -and $SDResult.Descriptor) {
+            $TotalMask = 0;
+            foreach ($Ace in $SDResult.Descriptor.DACL) {
+                if ($Ace.AceType -eq 0 -and $Ace.Trustee -and ($UserSids -contains $Ace.Trustee.SIDString)) {
+                    $TotalMask = $TotalMask -bor [int]$Ace.AccessMask;
+                }
+            }
+
+            $Perms.CanShadow     = (($TotalMask -band 16) -eq 16);
+            $Perms.CanDisconnect = (($TotalMask -band 32) -eq 32);
+            $Perms.CanLogoff     = (($TotalMask -band 64) -eq 64);
+            $Perms.CanMessage    = (($TotalMask -band 128) -eq 128);
+
+            $AllowedList = @();
+            if ($Perms.CanShadow)     { $AllowedList += "Подключение (Shadow)"; }
+            if ($Perms.CanLogoff)     { $AllowedList += "Завершение сеанса"; }
+            if ($Perms.CanDisconnect) { $AllowedList += "Отключение"; }
+            if ($Perms.CanMessage)    { $AllowedList += "Сообщения"; }
+
+            if ($AllowedList.Count -gt 0) {
+                $Perms.Summary = $AllowedList -join ", ";
+            } else {
+                $Perms.Summary = "Только просмотр списка (нет прав на управление)";
+            }
+        }
+    } catch {
+        $Perms.Summary = "Проверка WMI ограничена (нужны права на root\CIMV2\TerminalServices)";
+        $Perms.CanShadow = $true;
+        $Perms.CanLogoff = $true;
+    }
+
+    return $Perms;
+}
+
+$Script:ServerPermissions = @{};
+
+function Get-RDSSessions {
+    $Results = New-Object System.Collections.ArrayList;
+    $Script:ServerPermissions.Clear();
+
+    foreach ($Server in $Servers) {
+        $Tcp = New-Object System.Net.Sockets.TcpClient;
+        $Connect = $Tcp.BeginConnect($Server, 3389, $null, $null);
+        $IsOnline = $Connect.AsyncWaitHandle.WaitOne(500, $false);
+        $Tcp.Close();
+
+        if ($IsOnline) {
+            $Script:ServerPermissions[$Server] = Get-RDSUserPermissions -ServerName $Server;
+
+            $Lines = query session /server:$Server 2>$null | Select-Object -Skip 1;
+            foreach ($Line in $Lines) {
+                $CleanLine = $Line.Trim();
+                if ([string]::IsNullOrWhiteSpace($CleanLine)) { continue; }
+
+                $Parts = $CleanLine -split '\s{2,}';
+                if ($Parts.Count -lt 3) { continue; }
+
+                $SessionName = "";
+                $User        = "";
+                $ID          = "";
+                $State       = "";
+
+                if ($Parts[0] -match '^(>?rdp-tcp|console|services)') {
+                    if ($Parts[1] -match '^\d+$') { continue; }
+                    $SessionName = $Parts[0] -replace '^>', '';
+                    $User        = $Parts[1];
+                    $ID          = $Parts[2];
+                    $State       = if ($Parts.Count -ge 4) { $Parts[3] } else { "" };
+                }
+                elseif ($Parts[1] -match '^\d+$') {
+                    $User  = $Parts[0] -replace '^>', '';
+                    $ID    = $Parts[1];
+                    $State = if ($Parts.Count -ge 3) { $Parts[2] } else { "" };
+                }
+                else {
+                    continue;
+                }
+
+                $null = $Results.Add([PSCustomObject]@{
+                    Server  = $Server;
+                    User    = $User;
+                    ID      = $ID;
+                    State   = $State;
+                    Session = $SessionName
+                });
+            }
+
+            $QuserLines = quser /server:$Server 2>$null | Select-Object -Skip 1;
+            foreach ($QLine in $QuserLines) {
+                $QParts = $QLine.Trim() -split '\s{2,}';
+                if ($QParts.Count -ge 4) {
+                    $QID    = if ($QParts[1] -match '^\d+$') { $QParts[1] } else { $QParts[2] };
+                    $QIdle  = if ($QParts[1] -match '^\d+$') { $QParts[3] } else { if ($QParts.Count -ge 5) { $QParts[4] } else { "" } };
+                    $QLogon = if ($QParts[1] -match '^\d+$') { if ($QParts.Count -ge 5) { $QParts[4] } else { "" } } else { if ($QParts.Count -ge 6) { $QParts[5] } else { "" } };
+
+                    $Match = $Results | Where-Object { $_.Server -eq $Server -and $_.ID -eq $QID };
+                    if ($Match) {
+                        $Match | Add-Member -NotePropertyName "IdleTime" -NotePropertyValue $QIdle -Force;
+                        $Match | Add-Member -NotePropertyName "LogonTime" -NotePropertyValue $QLogon -Force;
+                    }
+                }
+            }
+        }
+    }
+    return ,$Results;
+}
+
+# --- СОЗДАНИЕ ГРАФИЧЕСКОГО ИНТЕРФЕЙСА ---
+$Form = New-Object System.Windows.Forms.Form;
+$Form.Text = "Панель техподдержки RDS (8 серверов)";
+$Form.Size = New-Object System.Drawing.Size(920, 600);
+$Form.StartPosition = "CenterScreen";
+$Form.MinimumSize = New-Object System.Drawing.Size(780, 450);
+
+# Верхняя адаптивная панель-сетка
+$TopPanel = New-Object System.Windows.Forms.TableLayoutPanel;
+$TopPanel.Location = New-Object System.Drawing.Point(12, 8);
+$TopPanel.Size = New-Object System.Drawing.Size(880, 32);
+$TopPanel.Anchor = "Top, Left, Right";
+$TopPanel.ColumnCount = 4;
+$TopPanel.RowCount = 1;
+$null = $TopPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)));
+$null = $TopPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)));
+$null = $TopPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)));
+$null = $TopPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)));
+$Form.Controls.Add($TopPanel);
+
+$LabelSearch = New-Object System.Windows.Forms.Label;
+$LabelSearch.Text = "Поиск (логин, сервер, ID):";
+$LabelSearch.AutoSize = $true;
+$LabelSearch.Anchor = "Left";
+$LabelSearch.Margin = New-Object System.Windows.Forms.Padding(0, 6, 6, 0);
+$TopPanel.Controls.Add($LabelSearch, 0, 0);
+
+$TextBoxSearch = New-Object System.Windows.Forms.TextBox;
+$TextBoxSearch.Dock = "Fill";
+$TextBoxSearch.Margin = New-Object System.Windows.Forms.Padding(0, 3, 12, 0);
+$TopPanel.Controls.Add($TextBoxSearch, 1, 0);
+
+$CheckShowInactive = New-Object System.Windows.Forms.CheckBox;
+$CheckShowInactive.Text = "Показывать неактивные (Disc)";
+$CheckShowInactive.AutoSize = $true;
+$CheckShowInactive.Checked = $true;
+$CheckShowInactive.Anchor = "Left";
+$CheckShowInactive.Margin = New-Object System.Windows.Forms.Padding(0, 5, 12, 0);
+$TopPanel.Controls.Add($CheckShowInactive, 2, 0);
+
+$LabelCount = New-Object System.Windows.Forms.Label;
+$LabelCount.Text = "Загрузка...";
+$LabelCount.AutoSize = $true;
+$LabelCount.Anchor = "Right";
+$LabelCount.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0);
+$TopPanel.Controls.Add($LabelCount, 3, 0);
+
+# Таблица сессий
+$Grid = New-Object System.Windows.Forms.DataGridView;
+$Grid.Location = New-Object System.Drawing.Point(12, 45);
+$Grid.Size = New-Object System.Drawing.Size(880, 415);
+$Grid.Anchor = "Top, Bottom, Left, Right";
+$Grid.ReadOnly = $true;
+$Grid.AllowUserToAddRows = $false;
+$Grid.AllowUserToDeleteRows = $false;
+$Grid.SelectionMode = "FullRowSelect";
+$Grid.MultiSelect = $false;
+$Grid.AutoSizeColumnsMode = "Fill";
+$Grid.RowHeadersVisible = $false;
+$Grid.BackgroundColor = [System.Drawing.Color]::White;
+$Form.Controls.Add($Grid);
+
+# Панель отображения доступных прав специалиста
+$PanelPerms = New-Object System.Windows.Forms.Panel;
+$PanelPerms.Location = New-Object System.Drawing.Point(12, 468);
+$PanelPerms.Size = New-Object System.Drawing.Size(880, 32);
+$PanelPerms.Anchor = "Bottom, Left, Right";
+$PanelPerms.BorderStyle = "FixedSingle";
+$PanelPerms.BackColor = [System.Drawing.Color]::AliceBlue;
+$Form.Controls.Add($PanelPerms);
+
+$LabelPerms = New-Object System.Windows.Forms.Label;
+$LabelPerms.Text = "Ваши права: выберите сессию или дождитесь загрузки...";
+$LabelPerms.Location = New-Object System.Drawing.Point(8, 7);
+$LabelPerms.AutoSize = $true;
+$LabelPerms.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold);
+$LabelPerms.ForeColor = [System.Drawing.Color]::DarkSlateBlue;
+$PanelPerms.Controls.Add($LabelPerms);
+
+# Кнопка "Обновить"
+$BtnRefresh = New-Object System.Windows.Forms.Button;
+$BtnRefresh.Text = "Обновить";
+$BtnRefresh.Location = New-Object System.Drawing.Point(12, 510);
+$BtnRefresh.Size = New-Object System.Drawing.Size(120, 35);
+$BtnRefresh.Anchor = "Bottom, Left";
+$Form.Controls.Add($BtnRefresh);
+
+# Кнопка "Завершить сессию"
+$BtnLogoff = New-Object System.Windows.Forms.Button;
+$BtnLogoff.Text = "Завершить сессию";
+$BtnLogoff.Location = New-Object System.Drawing.Point(585, 510);
+$BtnLogoff.Size = New-Object System.Drawing.Size(145, 35);
+$BtnLogoff.Anchor = "Bottom, Right";
+$BtnLogoff.BackColor = [System.Drawing.Color]::MistyRose;
+$Form.Controls.Add($BtnLogoff);
+
+# Кнопка "Подключиться"
+$BtnConnect = New-Object System.Windows.Forms.Button;
+$BtnConnect.Text = "Подключиться";
+$BtnConnect.Location = New-Object System.Drawing.Point(742, 510);
+$BtnConnect.Size = New-Object System.Drawing.Size(150, 35);
+$BtnConnect.Anchor = "Bottom, Right";
+$BtnConnect.BackColor = [System.Drawing.Color]::LightGreen;
+$Form.Controls.Add($BtnConnect);
+
+$Script:CachedSessions = @();
+
+function Update-PermissionsUI {
+    $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name;
+
+    if ($Grid.SelectedRows.Count -gt 0) {
+        $SelectedServer = $Grid.SelectedRows[0].Cells["Server"].Value;
+        $PermObj = $Script:ServerPermissions[$SelectedServer];
+
+        if ($PermObj) {
+            $LabelPerms.Text = "Специалист: $CurrentUser | Сервер: $SelectedServer | Доступные права: $($PermObj.Summary)";
+            $BtnConnect.Enabled = $PermObj.CanShadow;
+            $BtnLogoff.Enabled  = $PermObj.CanLogoff;
+        }
+    } else {
+        $FirstServer = $Script:ServerPermissions.Keys | Select-Object -First 1;
+        if ($FirstServer) {
+            $PermObj = $Script:ServerPermissions[$FirstServer];
+            $LabelPerms.Text = "Специалист: $CurrentUser | Доступные права (на $FirstServer): $($PermObj.Summary)";
+            $BtnConnect.Enabled = $PermObj.CanShadow;
+            $BtnLogoff.Enabled  = $PermObj.CanLogoff;
+        } else {
+            $LabelPerms.Text = "Специалист: $CurrentUser | Серверы недоступны";
+        }
+    }
+}
+
+function Update-GridDisplay {
+    $Filter = $TextBoxSearch.Text.Trim();
+    $ShowInactive = $CheckShowInactive.Checked;
+
+    $Filtered = $Script:CachedSessions | Where-Object {
+        $MatchSearch = [string]::IsNullOrEmpty($Filter) -or
+            $_.User -like "*$Filter*" -or
+            $_.Server -like "*$Filter*" -or
+            $_.ID -eq $Filter -or
+            $_.State -like "*$Filter*";
+
+        $MatchState = $ShowInactive -or ($_.State -match "Active|Актив");
+        $MatchSearch -and $MatchState;
+    };
+
+    $Table = New-Object System.Data.DataTable;
+    $null = $Table.Columns.Add("Server", [string]);
+    $null = $Table.Columns.Add("User", [string]);
+    $null = $Table.Columns.Add("ID", [string]);
+    $null = $Table.Columns.Add("State", [string]);
+    $null = $Table.Columns.Add("IdleTime", [string]);
+    $null = $Table.Columns.Add("LogonTime", [string]);
+
+    foreach ($Item in $Filtered) {
+        $IdleVal  = if ($Item.PSObject.Properties['IdleTime']) { $Item.IdleTime } else { "" };
+        $LogonVal = if ($Item.PSObject.Properties['LogonTime']) { $Item.LogonTime } else { "" };
+        $null = $Table.Rows.Add($Item.Server, $Item.User, $Item.ID, $Item.State, $IdleVal, $LogonVal);
+    }
+
+    $Grid.DataSource = $Table;
+    $LabelCount.Text = "Показано: $($Table.Rows.Count) из $($Script:CachedSessions.Count)";
+    Update-PermissionsUI;
+}
+
+function Refresh-Data {
+    $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor;
+    $BtnRefresh.Enabled = $false;
+    $LabelCount.Text = "Опрос серверов...";
+    $LabelPerms.Text = "Проверка прав доступа на серверах...";
+    [System.Windows.Forms.Application]::DoEvents();
+
+    $Script:CachedSessions = Get-RDSSessions;
+    Update-GridDisplay;
+
+    $BtnRefresh.Enabled = $true;
+    $Form.Cursor = [System.Windows.Forms.Cursors]::Default;
+}
+
+# --- СОБЫТИЯ ---
+$TextBoxSearch.Add_TextChanged({ Update-GridDisplay; });
+$CheckShowInactive.Add_CheckedChanged({ Update-GridDisplay; });
+$BtnRefresh.Add_Click({ Refresh-Data; });
+$Grid.Add_SelectionChanged({ Update-PermissionsUI; });
+
+$ConnectAction = {
+    if (-not $BtnConnect.Enabled) { return; }
+    if ($Grid.SelectedRows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Выберите сессию из списка.", "Внимание", "OK", "Warning");
+        return;
+    }
+    $Row = $Grid.SelectedRows[0];
+    $TargetServer = $Row.Cells["Server"].Value;
+    $TargetID     = $Row.Cells["ID"].Value;
+    $TargetState  = $Row.Cells["State"].Value;
+
+    if ($TargetState -notmatch "Active|Актив") {
+        [System.Windows.Forms.MessageBox]::Show("Невозможно подключиться к неактивной (отключенной) сессии. Пользователь должен быть в сети.", "Ошибка подключения", "OK", "Warning");
+        return;
+    }
+
+    Start-Process "mstsc.exe" -ArgumentList "/v:$TargetServer /shadow:$TargetID /control";
+};
+
+$BtnConnect.Add_Click($ConnectAction);
+$Grid.Add_CellDoubleClick($ConnectAction);
+
+$BtnLogoff.Add_Click({
+    if (-not $BtnLogoff.Enabled) { return; }
+    if ($Grid.SelectedRows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Выберите сессию для завершения.", "Внимание", "OK", "Warning");
+        return;
+    }
+    $Row = $Grid.SelectedRows[0];
+    $TargetServer = $Row.Cells["Server"].Value;
+    $TargetUser   = $Row.Cells["User"].Value;
+    $TargetID     = $Row.Cells["ID"].Value;
+
+    $Confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Вы действительно хотите принудительно завершить сессию пользователя '$TargetUser' (ID: $TargetID) на сервере $TargetServer?`n`nНесохраненные данные пользователя будут потеряны.",
+        "Подтверждение завершения сессии",
+        "YesNo",
+        "Question"
+    );
+
+    if ($Confirm -eq "Yes") {
+        $Output = logoff $TargetID /server:$TargetServer 2>&1;
+        if ($LASTEXITCODE -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Сессия пользователя $TargetUser успешно завершена.", "Готово", "OK", "Information");
+            Refresh-Data;
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Не удалось завершить сессию.`nОшибка: $Output", "Ошибка", "OK", "Error");
+        }
+    }
+});
+
+$Form.Add_Shown({ Refresh-Data; });
+[void]$Form.ShowDialog();
